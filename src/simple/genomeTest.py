@@ -16,6 +16,8 @@
 
 import sys
 import os
+import re
+import time
 
 from argparse import ArgumentParser
 from argparse import RawDescriptionHelpFormatter
@@ -25,6 +27,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQA
 from langchain.document_loaders import TextLoader
+from plotly.validators.streamtube import starts
+
 
 
 __all__ = []
@@ -32,7 +36,7 @@ __version__ = 0.1
 __date__ = '2023-09-20'
 __updated__ = '2023-09-20'
 
-DEBUG = 0
+DEBUG = 1
 PROFILE = 0
 
 class CLIError(Exception):
@@ -77,13 +81,21 @@ USAGE
         parser = ArgumentParser(description=program_license, formatter_class=RawDescriptionHelpFormatter)
         parser.add_argument("-v", "--verbose", dest="verbose", action="store_true", help="if specified, more status messages will be printed")
         parser.add_argument('-V', '--version', action='version', version=program_version_message)
+        parser.add_argument('-d', '--docs', dest="docMax", action="store", default=10, type=int,
+                            help="maximum number of documents per query to select from genome text file")
+        parser.add_argument('-t', '--tokenMax', dest="tokMax", action="store", default=256, type=int,
+                           help="maximum number of tokens to generate in the chat")
         parser.add_argument(dest="textFile", help="file containing the genome descriptive text", metavar="textFile")
 
         # Process arguments
         args = parser.parse_args()
-
+        doc_max = args.docMax
         textFile = args.textFile
         verbose = args.verbose
+        tokens_max = args.tokMax
+
+        if (doc_max < 1) :
+            print("Number of documents must be at least 1.")
 
         if verbose:
             print("Verbose mode on")
@@ -102,29 +114,75 @@ USAGE
         )
         texts = text_splitter.split_documents(documents)
         counter = len(texts)
-        print(f"{counter} lines of text found in data file.")
+        if verbose:
+            print(f"{counter} lines of text found in data file.")
         ## Now "texts" is a list of all the text lines.  The first line describes a genome.  All the other lines
         ## describe features.  Next we build the embedding vectors from the text lines.  Those vectors are used
         ## to find relevant documents, and will be stored in "vectordb".
+        if verbose:
+            print("Creating embedding vectors from the document.")
+        start = time.time()
         embeddings = OpenAIEmbeddings()
-        vectordb = Chroma.from_documents(documents=texts, embeddings=embeddings)
+        vectordb = Chroma.from_documents(documents=texts, embedding=embeddings)
+        if verbose:
+            duration = time.time() - start
+            print(f"{duration} sections to load text with {counter} paragraphs.")
         ## At this point we develop the AI chain.  "retriever" will be used to find relevant documents, "llm" to
         ## connect to OpenAI's model, and "qa_chain" to string them together.
-        retriever = vectordb.as_retriever(search_kwargs={"k": 2}) # k override 4 with 2
-        print("Creating OpenAI LLM chain.")
-        llm = ChatOpenAI(model_name="gpt-4", temperature=0.0, max_tokens = 128,)
+        if verbose:
+            print("Building retriever.")
+        retriever = vectordb.as_retriever(search_kwargs={"k": doc_max})
+        if verbose:
+            print("Creating OpenAI LLM chain.")
+        llm = ChatOpenAI(model_name="gpt-4", temperature=0.0, max_tokens = tokens_max,)
         qa_chain = RetrievalQA.from_chain_type(llm=llm,
                                                chain_type="stuff", # stuff all in at once
                                                retriever=retriever)
         ## Now we loop through prompts from the user, submitting them as queries
-        print("Type your query, or /q to quit.")
+        print("Type your first query, or ENTER for commands.")
         query = input()
         while (query != "/q") :
             # Only proceed if the query is nonblank.
-            if (query) :
+            if (not query) :
+                print("/q        -- terminate this session")
+                print("/d NN     -- change document max to NN")
+                print("/t NN     -- change token max to NN")
+                print("/x        -- list the current values of the modifiable options")
+            elif (query == "/x"):
+                print(f"Token max is {tokens_max}.")
+                print(f"Document max is {doc_max}.")
+            elif (query.startswith("/")):
+                m = re.match(r"/(.)\s+(.+)", query)
+                command = m.group(1)
+                parm = m.group(2)
+                if (command == "d") :
+                    # Here we need to change the number of documents retrieved.
+                    try:
+                        doc_max = int(parm)
+                        retriever = vectordb.as_retriever(search_kwargs={"k": doc_max})
+                        print(f"Document search threshold is now {doc_max}.")
+                    except TypeError :
+                        print(f"Invalid numeric value {parm}.")
+                elif (command == "t") :
+                    # Here we need to change the token limit.
+                    try:
+                        tokens_max = int(parm)
+                        llm = ChatOpenAI(model_name="gpt-4", temperature=0.0, max_tokens = tokens_max,)
+                        print(f"Chat token limit is now {tokens_max}.")
+                    except TypeError :
+                        print(f"Invalid numeric value {parm}.")
+                else :
+                    print(f"Invalid command code \"{command}\".")
+            else :
+                if verbose:
+                    print(f"Processing query: {query}")
                 llm_response = qa_chain(query)
                 print("--")
                 print(llm_response['result'])
+                print("--")
+            ## Ask for the next query.
+            print("Type your next query, or ENTER for commands.")
+            query = input()
         return 0
     except KeyboardInterrupt:
         print("Aborting execution after keyboard interrupt.")
