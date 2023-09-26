@@ -18,32 +18,25 @@ import sys
 import os
 import re
 import time
-import openai
+
 from argparse import ArgumentParser
 from argparse import RawDescriptionHelpFormatter
 from langchain.vectorstores import Chroma
 from langchain.embeddings import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQA
 from langchain.document_loaders import TextLoader
-from sqlalchemy.sql.expression import false
-import textwrap
+
+
 
 __all__ = []
 __version__ = 0.1
 __date__ = '2023-09-20'
 __updated__ = '2023-09-20'
 
-# In debug mode, exceptions are fatal and verbose defaults to ON
 DEBUG = 1
 PROFILE = 0
-QUERY_MODEL = "gpt-4"
-
-# These are global tuning parameters
-verbose = false
-tokens_max = 256
-doc_max = 4
-context = ""
-sys_context = ""
 
 class CLIError(Exception):
     '''Generic exception to raise and log different fatal errors.'''
@@ -55,8 +48,6 @@ class CLIError(Exception):
     def __unicode__(self):
         return self.msg
 
-
-# Main method
 def main(argv=None): # IGNORE:C0111
     '''Command line options.'''
 
@@ -89,12 +80,10 @@ USAGE
         parser = ArgumentParser(description=program_license, formatter_class=RawDescriptionHelpFormatter)
         parser.add_argument("-v", "--verbose", dest="verbose", action="store_true", help="if specified, more status messages will be printed")
         parser.add_argument('-V', '--version', action='version', version=program_version_message)
-        parser.add_argument('-d', '--docs', dest="docMax", action="store", default=4, type=int,
+        parser.add_argument('-d', '--docs', dest="docMax", action="store", default=10, type=int,
                             help="maximum number of documents per query to select from genome text file")
         parser.add_argument('-t', '--tokenMax', dest="tokMax", action="store", default=256, type=int,
                            help="maximum number of tokens to generate in the chat")
-        parser.add_argument('-n', '--numVertex', dest="numVertex", action = "store", default=32, type=int,
-                            help="number of neighbors to store in embedding database")
         parser.add_argument(dest="textFile", help="file containing the genome descriptive text", metavar="textFile")
 
         # Process arguments
@@ -136,11 +125,18 @@ USAGE
         vectordb = Chroma.from_documents(documents=texts, embedding=embeddings)
         if verbose:
             duration = time.time() - start
-            print(f"{duration} seconds to load text with {counter} paragraphs.")
-        # Create the relevant-document retriever.
+            print(f"{duration} sections to load text with {counter} paragraphs.")
+        ## At this point we develop the AI chain.  "retriever" will be used to find relevant documents, "llm" to
+        ## connect to OpenAI's model, and "qa_chain" to string them together.
+        if verbose:
+            print("Building retriever.")
         retriever = vectordb.as_retriever(search_kwargs={"k": doc_max})
-        ## This will keep the responses for use as system context.
-        sys_context = ""
+        if verbose:
+            print("Creating OpenAI LLM chain.")
+        llm = ChatOpenAI(model_name="gpt-4", temperature=0.0, max_tokens = tokens_max,)
+        qa_chain = RetrievalQA.from_chain_type(llm=llm,
+                                               chain_type="stuff", # stuff all in at once
+                                               retriever=retriever)
         ## Now we loop through prompts from the user, submitting them as queries
         print("Type your first query, or ENTER for commands.")
         query = input()
@@ -151,20 +147,9 @@ USAGE
                 print("/d NN     -- change document max to NN")
                 print("/t NN     -- change token max to NN")
                 print("/x        -- list the current values of the modifiable options")
-                print("/clear    -- erase the current response list")
-                print("/context  -- print the most recent context string")
             elif (query == "/x"):
                 print(f"Token max is {tokens_max}.")
                 print(f"Document max is {doc_max}.")
-            elif (query == "/clear"):
-                sys_size = len(sys_context) / 1024
-                print(f"Erasing {sys_size:.2f}K of data stored in system context")
-                sys_context = ""
-            elif (query == "/context"):
-                if (context == ""):
-                    print("No context yet.")
-                else:
-                    print(textwrap.fill(context))
             elif (query.startswith("/")):
                 m = re.match(r"/(.)\s+(.+)", query)
                 command = m.group(1)
@@ -173,14 +158,15 @@ USAGE
                     # Here we need to change the number of documents retrieved.
                     try:
                         doc_max = int(parm)
-                        print(f"Document search threshold is now {doc_max}.")
                         retriever = vectordb.as_retriever(search_kwargs={"k": doc_max})
+                        print(f"Document search threshold is now {doc_max}.")
                     except TypeError :
                         print(f"Invalid numeric value {parm}.")
                 elif (command == "t") :
                     # Here we need to change the token limit.
                     try:
                         tokens_max = int(parm)
+                        llm = ChatOpenAI(model_name="gpt-4", temperature=0.0, max_tokens = tokens_max,)
                         print(f"Chat token limit is now {tokens_max}.")
                     except TypeError :
                         print(f"Invalid numeric value {parm}.")
@@ -189,29 +175,10 @@ USAGE
             else :
                 if verbose:
                     print(f"Processing query: {query}")
-                # Get the relevant documents.
-                docs = retriever.get_relevant_documents(query)
-                # Form the documents into a context string.
-                context = ""
-                for doc in docs:
-                    context += " " + doc.page_content
-                if verbose:
-                    found = len(docs)
-                    print(f"{found} relevant documents found.")
-                msgs = [ {"role": "system",    "content": sys_context},
-                         {"role": "assistant", "content": context},
-                         {"role": "user",      "content": query} ]
-                response = openai.ChatCompletion.create(
-                    model=QUERY_MODEL,
-                    temperature=0.0,
-                    max_tokens=tokens_max,
-                    messages=msgs)
-                response_string = response['choices'][0]['message']['content']
+                llm_response = qa_chain(query)
                 print("--")
-                print(response_string)
+                print(llm_response['result'])
                 print("--")
-                # Update the system context
-                sys_context += " " + response_string
             ## Ask for the next query.
             print("Type your next query, or ENTER for commands.")
             query = input()
